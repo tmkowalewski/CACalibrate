@@ -18,16 +18,18 @@ A simple R script for taking in Cubix energy calibration data, performing a line
 Clone the repository and install dependencies:
 
 ```bash
-git clone <repository-url>
+git clone https://github.com/tmkowalewski/CACalibrate.git
 cd CACalibrate
 ```
 
 ## Usage
+Modify the regex expression on line 9 of `energy_fit.r` to fit your naming scheme for your cubix calibration data files, as well as the Configuration section of `align_and_merge.R` to point to the right paths and use your preferred fitting options.
 
-IN an R interactive prompt, call the script with
+To run the script, use
 ```
 source("/path/to/cloned/repository/align_and_merge.R", encoding = "UTF-8")
 ```
+within an R interactive prompt,
 
 ## Contributing
 
