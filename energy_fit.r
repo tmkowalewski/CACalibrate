@@ -5,24 +5,25 @@
 
 parse_filename_meta <- function(filepath) {
   bn <- basename(filepath)
-  # Expect names like: 70Ge_T_DEN_calibration.t  where DEN may include crystal (e.g. B1E1)
-  m <- regexec("^70Ge_([^_]+)_([^_]+)_calibration\\.(dat|func|res)$", bn, perl = TRUE)
+  # Expect names like: 11B_5.02_C1E1_calibration.dat
+  # Capture groups: run_type, detector, crystal label, file type.
+  m <- regexec("^(.+)_([CB][0-9]+)(E[0-9]+)_calibration\\.(dat|func|res)$", bn, perl = TRUE)
   res <- regmatches(bn, m)[[1]]
   if (length(res) == 0) {
-    return(list(run_type = NA_character_, detector = NA_character_, crystal = NA_integer_, file_type = NA_character_))
+    return(list(
+      run_type = NA_character_,
+      detector = NA_character_,
+      crystal = NA_character_,
+      crystal_num = NA_integer_,
+      file_type = NA_character_
+    ))
   }
   run_type <- res[2]
-  den <- res[3]
-  file_type <- res[4]
-  # detector may be letters+digits before an optional "E" crystal number
-  crystal <- NA_integer_
-  if (grepl("E[0-9]+$", den)) {
-    crystal <- as.integer(sub("^.*E", "", den))
-    detector <- sub("E[0-9]+$", "", den)
-  } else {
-    detector <- den
-  }
-  list(run_type = run_type, detector = detector, crystal = crystal, file_type = file_type)
+  detector <- res[3]
+  crystal <- res[4]
+  file_type <- res[5]
+  crystal_num <- as.integer(sub("^E", "", crystal))
+  list(run_type = run_type, detector = detector, crystal = crystal, crystal_num = crystal_num, file_type = file_type)
 }
 
 safe_read_table <- function(path, col.names = NULL) {
@@ -138,27 +139,35 @@ collect_calibrations <- function(root = "cubix_workspaces", recursive = TRUE, sa
     meta <- parse_filename_meta(f)
     meta$path <- f
     # record availability
-    summary_rows[[length(summary_rows) + 1]] <- data.frame(run_type = meta$run_type, detector = meta$detector, crystal = meta$crystal, file_type = meta$file_type, path = meta$path, stringsAsFactors = FALSE)
+    summary_rows[[length(summary_rows) + 1]] <- data.frame(
+      run_type = meta$run_type,
+      detector = meta$detector,
+      crystal = meta$crystal_num,
+      crystal_label = meta$crystal,
+      file_type = meta$file_type,
+      path = meta$path,
+      stringsAsFactors = FALSE
+    )
 
     if (meta$file_type == "dat") {
       df <- tryCatch(parse_dat(f), error = function(e) {
         warning("Failed parsing dat: ", f, " : ", e$message); data.frame()
       })
       if (nrow(df) > 0) {
-        df$run_type <- meta$run_type; df$detector <- meta$detector; df$crystal <- meta$crystal; df$path <- f
+        df$run_type <- meta$run_type; df$detector <- meta$detector; df$crystal <- meta$crystal_num; df$crystal_label <- meta$crystal; df$path <- f
         points_list[[length(points_list) + 1]] <- df
       }
     } else if (meta$file_type == "func") {
       ff <- tryCatch(parse_func(f), error = function(e) {
         warning("Failed parsing func: ", f, " : ", e$message); list(params = numeric(0), raw = character(0))
       })
-      fits_list[[length(fits_list) + 1]] <- data.frame(run_type = meta$run_type, detector = meta$detector, crystal = meta$crystal, path = f, params = list(ff$params), raw = paste(ff$raw, collapse = "\\n"), stringsAsFactors = FALSE)
+      fits_list[[length(fits_list) + 1]] <- data.frame(run_type = meta$run_type, detector = meta$detector, crystal = meta$crystal_num, crystal_label = meta$crystal, path = f, params = list(ff$params), raw = paste(ff$raw, collapse = "\\n"), stringsAsFactors = FALSE)
     } else if (meta$file_type == "res") {
       df <- tryCatch(parse_res(f), error = function(e) {
         warning("Failed parsing res: ", f, " : ", e$message); data.frame()
       })
       if (nrow(df) > 0) {
-        df$run_type <- meta$run_type; df$detector <- meta$detector; df$crystal <- meta$crystal; df$path <- f
+        df$run_type <- meta$run_type; df$detector <- meta$detector; df$crystal <- meta$crystal_num; df$crystal_label <- meta$crystal; df$path <- f
         res_list[[length(res_list) + 1]] <- df
       }
     }

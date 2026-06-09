@@ -1,22 +1,33 @@
 #!/usr/bin/env Rscript
 # align_and_merge.R
-# Purpose: Align 11B calibration runs to their corresponding AllCal runs for a
+# Purpose: Align 11B calibration runs to their corresponding reference runs for a
 # specific detector/crystal, merge unique peaks, fit a linear calibration to the
 # combined peak list, and characterise residual structure via a CV-selected
 # smoothing spline.
 
 ## ------------------------- Configuration ---------------------------------
 # Path to file containing fit funcitons and helper utilities for energy calibration
-energy_fit_path <- "/home/tylermk/TUNL/Data/NRF/70Ge/energy_calibration/energy_fit.r"
+energy_fit_path <- "energy_fit.r"
 # Directory to save output plots and calibration parameters
-outdir <- "/home/tylermk/TUNL/Data/NRF/70Ge/energy_calibration/calibrations"
+outdir <- "/home/tylermk/TUNL/Data/NRF/Ru104/energy_calibrations"
 # Directory containing cubix_workspaces with peak fits for all runs (will search recursively)
 cubix_files <- "/home/tylermk/TUNL/Data/NRF/70Ge/cubix_workspaces"
 
-# Minimum common peaks to perform per-run alignment
-min_matches <- 2
-# Digits used when matching energies across files (≈eV precision)
+# Run type to use as the reference calibration for each detector/crystal
+reference_run_type <- "70Ge_AllCal"
+# Regex used to choose which run types are aligned onto the reference. Set to
+# NULL to align every non-reference run type.
+match_run_type_pattern <- "^70Ge_(11B-[0-9.]+)$"
+
+# Fixed lines (keV) used for gain matching.
+gain_anchor_energies <- c(1460, 2614)
+# Search window (keV) around each anchor line.
+gain_anchor_window <- 5
+# Digits used when matching energies across files (eV precision)
 energy_match_digits <- 3
+# Tolerance in keV for nearest-neighbour energy matching. If NULL, falls back
+# to exact rounded matching via energy_match_digits.
+energy_match_tolerance <- 0.05
 # Smoothing spline grid resolution
 spline_grid_n <- 400
 # Maximum number of spline knots (basis dimension)
@@ -86,6 +97,46 @@ select_common_peaks <- function(run_pts, allcal_pts, digits = energy_match_digit
   run_df <- dedupe_peaks(run_pts, digits)
   all_df <- dedupe_peaks(allcal_pts, digits)
   if (nrow(run_df) == 0 || nrow(all_df) == 0) return(data.frame())
+
+  if (!is.null(energy_match_tolerance) && is.finite(energy_match_tolerance) && energy_match_tolerance > 0) {
+    run_energy <- as.numeric(run_df$energy)
+    all_energy <- as.numeric(all_df$energy)
+    dist_mat <- abs(outer(run_energy, all_energy, `-`))
+    idx <- which(is.finite(dist_mat) & dist_mat <= energy_match_tolerance, arr.ind = TRUE)
+    if (!nrow(idx)) return(data.frame())
+
+    cand <- data.frame(
+      run_idx = idx[, 1],
+      all_idx = idx[, 2],
+      abs_diff = dist_mat[idx],
+      stringsAsFactors = FALSE
+    )
+    cand <- cand[order(cand$abs_diff, cand$run_idx, cand$all_idx), , drop = FALSE]
+
+    used_run <- rep(FALSE, nrow(run_df))
+    used_all <- rep(FALSE, nrow(all_df))
+    keep <- logical(nrow(cand))
+    for (i in seq_len(nrow(cand))) {
+      ri <- cand$run_idx[i]
+      ai <- cand$all_idx[i]
+      if (!used_run[ri] && !used_all[ai]) {
+        keep[i] <- TRUE
+        used_run[ri] <- TRUE
+        used_all[ai] <- TRUE
+      }
+    }
+    cand <- cand[keep, , drop = FALSE]
+    if (!nrow(cand)) return(data.frame())
+
+    run_match <- run_df[cand$run_idx, , drop = FALSE]
+    all_match <- all_df[cand$all_idx, , drop = FALSE]
+    names(run_match) <- paste0(names(run_match), ".run")
+    names(all_match) <- paste0(names(all_match), ".all")
+    common <- cbind(run_match, all_match)
+    common$match_abs_diff <- cand$abs_diff
+    return(common)
+  }
+
   run_df$energy_key <- energy_key(run_df$energy, digits)
   all_df$energy_key <- energy_key(all_df$energy, digits)
   common <- merge(run_df, all_df, by = "energy_key", suffixes = c(".run", ".all"))
@@ -123,6 +174,66 @@ append_unique_peaks <- function(existing, additions, seen_keys, digits = energy_
   additions <- align_columns(additions, all_cols)
   combined <- rbind(existing, additions)
   list(data = combined, seen = c(seen_keys, energy_key(additions$energy, digits)), added = nrow(additions))
+}
+
+build_anchor_points <- function(df_combined) {
+  out <- as_df(df_combined)
+  if (nrow(out) == 0) return(out)
+  if ("channel_corrected" %in% names(out)) {
+    out$channel <- out$channel_corrected
+  }
+  if ("channel_corrected_err" %in% names(out)) {
+    out$xerr <- out$channel_corrected_err
+  }
+  out
+}
+
+select_gain_anchor_pairs <- function(run_pts, allcal_pts,
+                                     target_energies = gain_anchor_energies,
+                                     window_keV = gain_anchor_window,
+                                     digits = energy_match_digits) {
+  run_df <- dedupe_peaks(run_pts, digits)
+  all_df <- dedupe_peaks(allcal_pts, digits)
+  if (nrow(run_df) == 0 || nrow(all_df) == 0) return(data.frame())
+
+  used_run <- integer(0)
+  used_all <- integer(0)
+  out_rows <- list()
+
+  for (te in target_energies) {
+    run_idx <- which(is.finite(run_df$energy) & abs(run_df$energy - te) <= window_keV)
+    all_idx <- which(is.finite(all_df$energy) & abs(all_df$energy - te) <= window_keV)
+    run_idx <- setdiff(run_idx, used_run)
+    all_idx <- setdiff(all_idx, used_all)
+    if (!length(run_idx) || !length(all_idx)) next
+
+    grid <- expand.grid(run_idx = run_idx, all_idx = all_idx)
+    pair_cost <- abs(run_df$energy[grid$run_idx] - all_df$energy[grid$all_idx]) +
+      abs(run_df$energy[grid$run_idx] - te) +
+      abs(all_df$energy[grid$all_idx] - te)
+    best <- which.min(pair_cost)
+    ri <- grid$run_idx[best]
+    ai <- grid$all_idx[best]
+
+    run_match <- run_df[ri, , drop = FALSE]
+    all_match <- all_df[ai, , drop = FALSE]
+    names(run_match) <- paste0(names(run_match), ".run")
+    names(all_match) <- paste0(names(all_match), ".all")
+    row <- cbind(run_match, all_match)
+    row$target_energy <- te
+    row$target_delta.run <- run_match$energy.run - te
+    row$target_delta.all <- all_match$energy.all - te
+    row$match_abs_diff <- abs(run_match$energy.run - all_match$energy.all)
+    out_rows[[length(out_rows) + 1]] <- row
+
+    used_run <- c(used_run, ri)
+    used_all <- c(used_all, ai)
+  }
+
+  if (!length(out_rows)) return(data.frame())
+  out <- do.call(rbind, out_rows)
+  rownames(out) <- NULL
+  out
 }
 
 fit_alignment <- function(common) {
@@ -289,13 +400,13 @@ plot_per_run <- function(common, rt, outdir, cfg_detector, cfg_crystal) {
     geom_point() +
     geom_smooth(method = "lm", se = FALSE) +
     labs(
-      title = paste("Align", rt, "-> AllCal", sprintf("(%sE%d)", cfg_detector, cfg_crystal)),
+      title = paste("Align", rt, "->", reference_run_type, sprintf("(%sE%d)", cfg_detector, cfg_crystal)),
       x = "channel (11B run)",
-      y = "channel (AllCal)"
+      y = paste("channel (", reference_run_type, ")", sep = "")
     ) +
     theme_minimal()
   safe_rt <- gsub("[^A-Za-z0-9_-]", "_", rt)
-  #out_fn <- file.path(outdir, paste0("align_", safe_rt, "_to_AllCal_", cfg_detector, "E", cfg_crystal, ".png"))
+  #out_fn <- file.path(outdir, paste0("align_", safe_rt, "_to_", gsub("[^A-Za-z0-9_-]", "_", reference_run_type), "_", cfg_detector, "E", cfg_crystal, ".png"))
   #suppressMessages(suppressWarnings(ggsave(filename = out_fn, plot = p, width = 6.5, height = 4.5, dpi = 150)))
   invisible(NULL)
 }
@@ -306,9 +417,9 @@ plot_combined <- function(df_combined, spline_df, knots_df, outdir, cfg_detector
 
   df_plot <- df_plot[order(df_plot$channel_corrected, df_plot$energy), ]
   df_plot$run_display <- if ("run_type" %in% names(df_plot)) {
-    ifelse(is.na(df_plot$run_type) | df_plot$run_type == "", "AllCal", df_plot$run_type)
+    ifelse(is.na(df_plot$run_type) | df_plot$run_type == "", reference_run_type, df_plot$run_type)
   } else {
-    rep("AllCal", nrow(df_plot))
+    rep(reference_run_type, nrow(df_plot))
   }
 
   p_linear <- ggplot(df_plot, aes(x = channel_corrected, y = energy, colour = run_display)) +
@@ -316,7 +427,7 @@ plot_combined <- function(df_combined, spline_df, knots_df, outdir, cfg_detector
     geom_line(data = df_plot, aes(x = channel_corrected, y = pred), colour = "steelblue", linewidth = 0.9, inherit.aes = FALSE) +
     labs(
       title = paste("Linear energy fit", sprintf("(%sE%d)", cfg_detector, cfg_crystal)),
-      x = "Channel (AllCal-aligned)",
+      x = paste("Channel (", reference_run_type, "-aligned)", sep = ""),
       y = "Energy (keV)"
     ) +
     theme_minimal() +
@@ -336,7 +447,6 @@ plot_combined <- function(df_combined, spline_df, knots_df, outdir, cfg_detector
       x = "Predicted energy (keV)",
       y = "Residual (keV)"
     ) +
-    coord_cartesian(ylim = c(-2.5, 2.5)) +
     theme_minimal()
 
   if (!is.null(spline_df)) {
@@ -396,7 +506,6 @@ plot_combined <- function(df_combined, spline_df, knots_df, outdir, cfg_detector
         x = "Predicted energy (keV)",
         y = "Residual - spline (keV)"
       ) +
-      coord_cartesian(ylim = c(-2.5, 2.5)) +
       theme_minimal()
     if (any(!is.na(df_plot$combo_se))) {
       p_resid_spline <- p_resid_spline +
@@ -467,6 +576,34 @@ save_models <- function(alignments, final_fit, spline_model, outdir, cfg_detecto
   )
 }
 
+save_alignment_diagnostics <- function(diag_df, outdir, cfg_detector, cfg_crystal) {
+  if (is.null(diag_df) || !nrow(diag_df)) return(invisible(NULL))
+  out_file <- file.path(outdir, paste0(cfg_detector, "E", cfg_crystal, ".alignment_diagnostics", ".tsv"))
+  write.table(diag_df, file = out_file, quote = FALSE, sep = "\t", row.names = FALSE, col.names = TRUE)
+  message("Alignment diagnostics saved to: ", out_file)
+  invisible(NULL)
+}
+
+reset_output_dir <- function(path) {
+  if (!nzchar(path) || normalizePath(path, winslash = "/", mustWork = FALSE) %in% c("/", ".")) {
+    stop("Refusing to wipe unsafe output directory path: ", path)
+  }
+
+  if (!dir.exists(path)) {
+    dir.create(path, recursive = TRUE)
+    return(invisible(NULL))
+  }
+
+  children <- list.files(path, all.files = TRUE, no.. = TRUE, full.names = TRUE)
+  if (length(children)) {
+    ok <- unlink(children, recursive = TRUE, force = TRUE)
+    if (any(ok != 0)) {
+      warning("Some output files could not be removed from: ", path)
+    }
+  }
+  invisible(NULL)
+}
+
 ## ------------------------- Main workflow --------------------------------
 run_one <- function(cfg_detector, cfg_crystal, res_all) {
 
@@ -474,37 +611,98 @@ run_one <- function(cfg_detector, cfg_crystal, res_all) {
 
   message(sprintf("\n========== Processing %sE%d ==========", cfg_detector, cfg_crystal))
 
-  allcal_points <- subset(res_all$points, run_type == "AllCal" & detector == cfg_detector & crystal == cfg_crystal)
-  if (!nrow(allcal_points)) {
-    message(sprintf("No AllCal peaks found for %sE%d — skipping", cfg_detector, cfg_crystal))
+  diag_rows <- list()
+  push_diag <- function(run_type, status, reason, n_input = NA_integer_,
+                        n_matches_direct = NA_integer_, n_matches_anchor = NA_integer_,
+                        n_matches_used = NA_integer_, match_source = NA_character_,
+                        n_added = NA_integer_) {
+    diag_rows[[length(diag_rows) + 1]] <<- data.frame(
+      detector = cfg_detector,
+      crystal = cfg_crystal,
+      run_type = run_type,
+      status = status,
+      reason = reason,
+      n_input_peaks = n_input,
+      n_matches_direct = n_matches_direct,
+      n_matches_anchor = n_matches_anchor,
+      n_matches_used = n_matches_used,
+      match_source = match_source,
+      n_added_peaks = n_added,
+      stringsAsFactors = FALSE
+    )
+  }
+
+  reference_points <- subset(res_all$points, run_type == reference_run_type & detector == cfg_detector & crystal == cfg_crystal)
+  if (!nrow(reference_points)) {
+    message(sprintf("No %s peaks found for %sE%d — skipping", reference_run_type, cfg_detector, cfg_crystal))
+    push_diag(run_type = reference_run_type, status = "missing_reference", reason = "no_reference_peaks")
+    save_alignment_diagnostics(do.call(rbind, diag_rows), outdir, cfg_detector, cfg_crystal)
     return(invisible(NULL))
   }
-  allcal_points <- dedupe_peaks(allcal_points)
-  allcal_points <- assign_channel_error(allcal_points)
-  allcal_points$channel_corrected <- allcal_points$channel
-  allcal_points$channel_corrected_err <- if ("xerr" %in% names(allcal_points)) allcal_points$xerr else NA_real_
+  reference_points <- dedupe_peaks(reference_points)
+  reference_points <- assign_channel_error(reference_points)
+  reference_points$channel_corrected <- reference_points$channel
+  reference_points$channel_corrected_err <- if ("xerr" %in% names(reference_points)) reference_points$xerr else NA_real_
 
-  seen_keys <- energy_key(allcal_points$energy)
-  combined <- allcal_points
+  seen_keys <- energy_key(reference_points$energy)
+  combined <- reference_points
 
-  runs_11B <- subset(res_all$summary, grepl("11B", run_type) & detector == cfg_detector & crystal == cfg_crystal)
-  runs_11B <- unique(runs_11B$run_type)
-  runs_11B <- runs_11B[order(runs_11B)]
+  run_summary_all <- subset(res_all$summary, detector == cfg_detector & crystal == cfg_crystal & run_type != reference_run_type)
+  run_summary <- run_summary_all
+  if (!is.null(match_run_type_pattern) && nzchar(match_run_type_pattern)) {
+    run_summary <- subset(run_summary, grepl(match_run_type_pattern, run_type))
+  }
+  excluded_runs <- setdiff(unique(run_summary_all$run_type), unique(run_summary$run_type))
+  if (length(excluded_runs)) {
+    for (rt in sort(excluded_runs)) {
+      push_diag(run_type = rt, status = "excluded", reason = "excluded_by_run_type_pattern")
+    }
+  }
+
+  runs_to_align <- unique(run_summary$run_type)
+  runs_to_align <- runs_to_align[order(runs_to_align)]
 
   alignments <- list()
 
-  for (rt in runs_11B) {
+  for (rt in runs_to_align) {
     pts <- subset(res_all$points, run_type == rt & detector == cfg_detector & crystal == cfg_crystal)
     pts <- dedupe_peaks(pts)
     pts <- assign_channel_error(pts)
+    n_input <- nrow(pts)
     if (nrow(pts) < 2) {
       message(sprintf("Skipping %s: insufficient peaks", rt))
+      push_diag(run_type = rt, status = "skipped", reason = "insufficient_peaks", n_input = n_input)
       next
     }
 
-    common <- select_common_peaks(pts, allcal_points)
-    if (nrow(common) < min_matches) {
-      message(sprintf("Skipping %s: only %d matching peaks (need >= %d)", rt, nrow(common), min_matches))
+    common_direct <- select_gain_anchor_pairs(pts, reference_points)
+    common <- common_direct
+    n_direct <- nrow(common_direct)
+    n_anchor <- NA_integer_
+    match_source <- "direct"
+    required_pairs <- length(gain_anchor_energies)
+    if (nrow(common) < required_pairs) {
+      anchor_points <- build_anchor_points(combined)
+      common_anchor <- select_gain_anchor_pairs(pts, anchor_points)
+      n_anchor <- nrow(common_anchor)
+      if (nrow(common_anchor) > nrow(common)) {
+        common <- common_anchor
+        match_source <- "anchor"
+      }
+    }
+    if (nrow(common) < required_pairs) {
+      message(sprintf("Skipping %s: found %d/%d gain anchor lines (1460, 2614 keV)", rt, nrow(common), required_pairs))
+      push_diag(
+        run_type = rt,
+        status = "skipped",
+        reason = "insufficient_gain_anchor_lines",
+        n_input = n_input,
+        n_matches_direct = n_direct,
+        n_matches_anchor = n_anchor,
+        n_matches_used = nrow(common),
+        match_source = match_source,
+        n_added = 0L
+      )
       next
     }
 
@@ -520,8 +718,30 @@ run_one <- function(cfg_detector, cfg_crystal, res_all) {
 
     if (res_append$added > 0) {
       message(sprintf("Added %d unique peaks from %s", res_append$added, rt))
+      push_diag(
+        run_type = rt,
+        status = "added",
+        reason = "aligned_and_merged",
+        n_input = n_input,
+        n_matches_direct = n_direct,
+        n_matches_anchor = n_anchor,
+        n_matches_used = nrow(common),
+        match_source = match_source,
+        n_added = res_append$added
+      )
     } else {
       message(sprintf("No new unique peaks contributed by %s", rt))
+      push_diag(
+        run_type = rt,
+        status = "aligned_no_new",
+        reason = "all_peaks_already_present",
+        n_input = n_input,
+        n_matches_direct = n_direct,
+        n_matches_anchor = n_anchor,
+        n_matches_used = nrow(common),
+        match_source = match_source,
+        n_added = 0L
+      )
     }
 
     plot_per_run(common, rt, outdir, cfg_detector, cfg_crystal)
@@ -530,8 +750,8 @@ run_one <- function(cfg_detector, cfg_crystal, res_all) {
   combined <- as_df(combined)
   if (!"channel_corrected" %in% names(combined)) combined$channel_corrected <- combined$channel
 
-  cat("\nAllCal peaks (deduplicated) for ", cfg_detector, "E", cfg_crystal, ":\n", sep = "")
-  print(allcal_points[order(allcal_points$energy), c("energy", "channel", "channel_corrected")])
+  cat("\n", reference_run_type, " peaks (deduplicated) for ", cfg_detector, "E", cfg_crystal, ":\n", sep = "")
+  print(reference_points[order(reference_points$energy), c("energy", "channel", "channel_corrected")])
 
   cat("\nCombined peak list prior to linear fit:\n")
   combined_print <- combined
@@ -579,10 +799,14 @@ run_one <- function(cfg_detector, cfg_crystal, res_all) {
 
   save_spline_knots(spline_res$spline_model, final_fit, outdir, cfg_detector, cfg_crystal)
   save_models(alignments, final_fit, spline_res$spline_model, outdir, cfg_detector, cfg_crystal)
+  if (length(diag_rows)) {
+    save_alignment_diagnostics(do.call(rbind, diag_rows), outdir, cfg_detector, cfg_crystal)
+  }
   invisible(NULL)
 }
 
 main <- function() {
+  reset_output_dir(outdir)
   res_all <- load_data()
   for (det in all_detectors) {
     for (crys in all_crystals) {
